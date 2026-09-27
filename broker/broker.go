@@ -58,7 +58,10 @@ func New(cfg Config) (*Broker, error) {
 		}
 	}
 	b := &Broker{cfg: cfg, st: st, state: state, notify: make(chan struct{}, 1)}
-	if recovered > 0 {
+	// 补齐崩溃前未完成的死信重放：已转换的消息不会重复转换，
+	// 未转换且仍是 dead 的目标在此补齐，整批结果确定。
+	replaysResumed := b.recoverReplaysLocked()
+	if recovered > 0 || replaysResumed {
 		if err := b.st.save(b.state); err != nil {
 			return nil, fmt.Errorf("persist recovery: %w", err)
 		}
@@ -139,28 +142,35 @@ func (b *Broker) Produce(ctx context.Context, group string, payload []byte) (str
 	}
 }
 
-// deliverableLocked 返回当前可投递消息：pending、NotBefore 已到、
-// 且其分组内没有 inflight 消息、也没有更小序号的 pending 消息。
+// deliverableLocked 返回当前可投递消息。投递以"组头"为单位：
+// 每个分组内序号最小的 pending 消息是该组的组头，组头退避未到期时，
+// 全组（包括序号更大的重放消息）都等待；只有已到期且组内没有 inflight
+// 的组头才可投递。因此任何消息——包括重放回队的消息——都不能越过同组
+// 尚未处理完（含退避等待）的前序消息。多个可投递组头中取全局最小序号。
 func (b *Broker) deliverableLocked(now time.Time) *Message {
 	inflightGroups := map[string]bool{}
-	var candidates []*Message
+	heads := map[string]*Message{}
 	for _, m := range b.state.Messages {
 		switch m.Status {
 		case StatusInflight:
 			inflightGroups[m.Group] = true
 		case StatusPending:
-			if !m.NotBefore.After(now) {
-				candidates = append(candidates, m)
+			if h, ok := heads[m.Group]; !ok || m.Seq < h.Seq {
+				heads[m.Group] = m
 			}
 		}
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Seq < candidates[j].Seq })
-	for _, m := range candidates {
-		if !inflightGroups[m.Group] {
-			return m // 全局最小序号且组内无在途消息
+	var candidates []*Message
+	for g, h := range heads {
+		if !inflightGroups[g] && !h.NotBefore.After(now) {
+			candidates = append(candidates, h)
 		}
 	}
-	return nil
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Seq < candidates[j].Seq })
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[0]
 }
 
 // nextRetryLocked 返回最近的退避到期时间（用于定时唤醒）。
@@ -250,8 +260,11 @@ func (b *Broker) Ack(id string) error {
 }
 
 // Nack 拒绝一条 inflight 消息。retryable=true 时按退避重试，
-// 超过 MaxRetries 进死信（DeadRetryExhausted）；否则直接进死信
-// （DeadNonRetryable）。判定依据记录在消息的 ErrorClass/DeadReason 上。
+// 超过 MaxRetries 进死信（DeadRetryExhausted / 重放后为
+// DeadReplayExhausted）；否则直接进死信（DeadNonRetryable /
+// DeadReplayNonRetryable）。判定依据记录在消息的
+// ErrorClass/DeadReason 上，并追加一条 dead 生命周期事件，
+// 历史判定不会被后续重放抹掉。
 func (b *Broker) Nack(id string, retryable bool, cause string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -269,11 +282,21 @@ func (b *Broker) Nack(id string, retryable bool, cause string) error {
 	if !retryable {
 		m.ErrorClass = ErrClassNonRetryable
 		m.Status = StatusDead
-		m.DeadReason = DeadNonRetryable
+		if m.ReplayGen > 0 {
+			m.DeadReason = DeadReplayNonRetryable
+		} else {
+			m.DeadReason = DeadNonRetryable
+		}
+		b.appendDeadEventLocked(m)
 	} else if m.Attempts > b.cfg.MaxRetries {
 		m.ErrorClass = ErrClassRetryable
 		m.Status = StatusDead
-		m.DeadReason = DeadRetryExhausted
+		if m.ReplayGen > 0 {
+			m.DeadReason = DeadReplayExhausted
+		} else {
+			m.DeadReason = DeadRetryExhausted
+		}
+		b.appendDeadEventLocked(m)
 	} else {
 		m.ErrorClass = ErrClassRetryable
 		m.Status = StatusPending
@@ -285,6 +308,20 @@ func (b *Broker) Nack(id string, retryable bool, cause string) error {
 	}
 	b.signal()
 	return nil
+}
+
+// appendDeadEventLocked 在消息进入死信时追加一条只增的生命周期事件。
+// 调用方需持锁。事件快照了当前字段，之后重放不会改动这条历史。
+func (b *Broker) appendDeadEventLocked(m *Message) {
+	b.state.Events = append(b.state.Events, LifecycleEvent{
+		Time:      time.Now(),
+		MessageID: m.ID,
+		Kind:      EventDead,
+		Reason:    m.DeadReason,
+		Error:     m.LastError,
+		ReplayID:  m.OriginReplayID,
+		ReplayGen: m.ReplayGen,
+	})
 }
 
 // DeadLetters 返回当前死信列表（快照，按序号排序）。

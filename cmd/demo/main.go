@@ -102,6 +102,29 @@ func main() {
 	}
 	_ = badID
 
+	// 4.5 死信重放：修复"根因"后，把该分组的死信重新投入投递链路。
+	res, err := b.ReplayDeadGroup(context.Background(), "jobs")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("[replay] 重放请求 %s：%v 重新入队（原死信记录保留）\n", res.ReplayID, res.Replayed)
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	rm, err := b.Receive(ctx)
+	cancel()
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("[consume] 重放消息再投递 id=%s attempts=%d replay_gen=%d\n",
+		rm.ID, rm.Attempts, rm.ReplayGen)
+	if err := b.Ack(rm.ID); err != nil {
+		log.Fatal(err)
+	}
+	hist, _ := b.History(rm.ID)
+	for _, e := range hist {
+		fmt.Printf("[history] id=%s kind=%s reason=%s replay_id=%s\n",
+			e.MessageID, e.Kind, e.Reason, e.ReplayID)
+	}
+
 	// 5. 模拟崩溃恢复：未确认消息重启后重投。
 	pendingID, _ := b.Produce(context.Background(), "jobs", []byte("will-crash"))
 	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)

@@ -17,15 +17,22 @@ type store struct {
 
 // state 是持久化的完整状态快照。
 type state struct {
-	Seq      uint64              `json:"seq"`
-	Messages map[string]*Message `json:"messages"`
-	Offsets  map[string]uint64   `json:"offsets"` // 消费组 -> 已提交位点
+	Seq       uint64                   `json:"seq"`
+	Messages  map[string]*Message      `json:"messages"`
+	Offsets   map[string]uint64        `json:"offsets"` // 消费组 -> 已提交位点
+	ReplaySeq uint64                   `json:"replay_seq"`
+	Replays   map[string]*ReplayRecord `json:"replays,omitempty"` // 重放请求记录
+	Events    []LifecycleEvent         `json:"events,omitempty"`  // 死信/重放生命周期事件（只追加）
 }
 
 func newStore(dir string) *store { return &store{path: filepath.Join(dir, "state.json")} }
 
 func newState() *state {
-	return &state{Messages: map[string]*Message{}, Offsets: map[string]uint64{}}
+	return &state{
+		Messages: map[string]*Message{},
+		Offsets:  map[string]uint64{},
+		Replays:  map[string]*ReplayRecord{},
+	}
 }
 
 // load 读取状态；文件不存在时返回空状态；文件损坏时返回错误而不是
@@ -47,6 +54,9 @@ func (s *store) load() (*state, error) {
 	}
 	if st.Offsets == nil {
 		st.Offsets = map[string]uint64{}
+	}
+	if st.Replays == nil {
+		st.Replays = map[string]*ReplayRecord{}
 	}
 	return st, nil
 }

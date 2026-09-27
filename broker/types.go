@@ -30,8 +30,10 @@ const (
 type DeadReason string
 
 const (
-	DeadRetryExhausted DeadReason = "retry_exhausted" // 重试次数耗尽
-	DeadNonRetryable   DeadReason = "non_retryable"   // 不可重试错误
+	DeadRetryExhausted     DeadReason = "retry_exhausted"        // 首次生命周期内重试次数耗尽
+	DeadNonRetryable       DeadReason = "non_retryable"          // 首次生命周期内不可重试错误
+	DeadReplayExhausted    DeadReason = "replay_retry_exhausted" // 重放后再次耗尽重试
+	DeadReplayNonRetryable DeadReason = "replay_non_retryable"   // 重放后再次被判定不可重试
 )
 
 // Message 是代理中的一条消息。
@@ -46,6 +48,12 @@ type Message struct {
 	LastError  string     `json:"last_error,omitempty"`
 	ErrorClass ErrorClass `json:"error_class,omitempty"`
 	DeadReason DeadReason `json:"dead_reason,omitempty"`
+	// ReplayGen 记录消息已被成功重放的次数：0 表示首次生命周期；
+	// 再次进入死信时据此把原因标记为 replay_*，与首次失败区分。
+	ReplayGen int `json:"replay_gen,omitempty"`
+	// OriginReplayID 记录当前生命周期由哪次重放发起（首次生命周期为空），
+	// 再次进死信时写入 dead 事件，便于把两次判定关联起来。
+	OriginReplayID string `json:"origin_replay_id,omitempty"`
 }
 
 // 可区分的错误原因，调用方可用 errors.Is 判定。
