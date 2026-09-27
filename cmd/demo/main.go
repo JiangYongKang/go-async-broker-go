@@ -100,6 +100,36 @@ func main() {
 	for _, dl := range b.DeadLetters() {
 		fmt.Printf("[dead] id=%s reason=%s last_error=%s\n", dl.ID, dl.DeadReason, dl.LastError)
 	}
+
+	// 4b. 死信重放：根因修复后把死信送回正常链路再消费一遍。
+	if len(b.DeadLetters()) > 0 {
+		ids := []string{}
+		for _, dl := range b.DeadLetters() {
+			ids = append(ids, dl.ID)
+		}
+		res, err := b.ReplayGroup(context.Background(), "jobs")
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("[replay] 分组 jobs 重放 total=%d replayed=%d remaining=%d id=%s\n",
+			res.Total, res.Replayed, res.Remaining, res.ReplayID)
+		// 重复重放同一批：已不在死信，被幂等拒绝，不会产生重复在途消息。
+		if _, err := b.ReplayMessages(context.Background(), ids); errors.Is(err, broker.ErrEmptyReplay) {
+			fmt.Printf("[replay] 重复重放 %v 被幂等抑制（%v）\n", ids, broker.ErrEmptyReplay)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		m, err := b.Receive(ctx)
+		cancel()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := b.Ack(m.ID); err != nil {
+			log.Fatal(err)
+		}
+		g, _ := b.Get(m.ID)
+		fmt.Printf("[replay] 重放消息 id=%s round=%d 已确认；死亡历史 %d 条、重放历史 %d 条（记录保留可查）\n",
+			m.ID, g.Round, len(g.DeadHistory), len(g.ReplayHistory))
+	}
 	_ = badID
 
 	// 5. 模拟崩溃恢复：未确认消息重启后重投。

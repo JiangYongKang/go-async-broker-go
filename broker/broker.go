@@ -18,12 +18,14 @@ import (
 //   - 同一分组同一时刻至多一条 inflight，且只允许组内最小序号投递，
 //     因此正常投递与重试过程中组内顺序稳定。
 type Broker struct {
-	cfg    Config
-	st     *store
-	mu     sync.Mutex
-	notify chan struct{} // 状态变化信号（容量释放/新消息可投递）
-	state  *state
-	closed bool
+	cfg      Config
+	st       *store
+	mu       sync.Mutex
+	notify   chan struct{} // 状态变化信号（容量释放/新消息可投递）
+	state    *state
+	closed   bool
+	pumpStop chan struct{} // 关闭重放后台泵
+	pumpDone chan struct{} // 泵已退出
 }
 
 // New 打开（或创建）一个 Broker，并从本地存储恢复状态。
@@ -57,12 +59,20 @@ func New(cfg Config) (*Broker, error) {
 			recovered++
 		}
 	}
-	b := &Broker{cfg: cfg, st: st, state: state, notify: make(chan struct{}, 1)}
+	b := &Broker{
+		cfg: cfg, st: st, state: state,
+		notify:   make(chan struct{}, 1),
+		pumpStop: make(chan struct{}),
+		pumpDone: make(chan struct{}),
+	}
 	if recovered > 0 {
 		if err := b.st.save(b.state); err != nil {
 			return nil, fmt.Errorf("persist recovery: %w", err)
 		}
 	}
+	// 恢复在途的死信重放意图：崩溃前未推完的重放由后台泵幂等续跑，
+	// 已重放的按 Applied 去重不会重放两次，未重放的不会丢。
+	go b.replayPump()
 	return b, nil
 }
 
@@ -141,24 +151,40 @@ func (b *Broker) Produce(ctx context.Context, group string, payload []byte) (str
 
 // deliverableLocked 返回当前可投递消息：pending、NotBefore 已到、
 // 且其分组内没有 inflight 消息、也没有更小序号的 pending 消息。
+//
+// 队首阻塞语义：组内更小序号的 pending 消息即使正处于重试退避
+// （NotBefore 未到），也会挡住后续消息——包括从死信重放回来、排在
+// 队尾的消息，因此重放消息不会越过组内未处理完的消息插队。
 func (b *Broker) deliverableLocked(now time.Time) *Message {
+	// 每个分组的最小序号 pending 消息（无论是否在退避）。
+	head := map[string]uint64{}
 	inflightGroups := map[string]bool{}
-	var candidates []*Message
 	for _, m := range b.state.Messages {
 		switch m.Status {
 		case StatusInflight:
 			inflightGroups[m.Group] = true
 		case StatusPending:
-			if !m.NotBefore.After(now) {
-				candidates = append(candidates, m)
+			if s, ok := head[m.Group]; !ok || m.Seq < s {
+				head[m.Group] = m.Seq
 			}
 		}
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Seq < candidates[j].Seq })
-	for _, m := range candidates {
-		if !inflightGroups[m.Group] {
-			return m // 全局最小序号且组内无在途消息
+	var candidates []*Message
+	for _, m := range b.state.Messages {
+		if m.Status != StatusPending || m.NotBefore.After(now) {
+			continue
 		}
+		// 只允许组内队首参与投递；更小序号消息在退避时整组等待。
+		if head[m.Group] != m.Seq {
+			continue
+		}
+		if !inflightGroups[m.Group] {
+			candidates = append(candidates, m)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Seq < candidates[j].Seq })
+	if len(candidates) > 0 {
+		return candidates[0]
 	}
 	return nil
 }
@@ -269,11 +295,21 @@ func (b *Broker) Nack(id string, retryable bool, cause string) error {
 	if !retryable {
 		m.ErrorClass = ErrClassNonRetryable
 		m.Status = StatusDead
-		m.DeadReason = DeadNonRetryable
+		if m.Round > 0 {
+			m.DeadReason = DeadReplayNonRetryable
+		} else {
+			m.DeadReason = DeadNonRetryable
+		}
+		b.appendDeadLocked(m, m.DeadReason)
 	} else if m.Attempts > b.cfg.MaxRetries {
 		m.ErrorClass = ErrClassRetryable
 		m.Status = StatusDead
-		m.DeadReason = DeadRetryExhausted
+		if m.Round > 0 {
+			m.DeadReason = DeadReplayRetryExhausted
+		} else {
+			m.DeadReason = DeadRetryExhausted
+		}
+		b.appendDeadLocked(m, m.DeadReason)
 	} else {
 		m.ErrorClass = ErrClassRetryable
 		m.Status = StatusPending
@@ -312,14 +348,30 @@ func (b *Broker) Pending() int {
 // Close 关闭引擎并落盘最终状态。
 func (b *Broker) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.closed {
+		b.mu.Unlock()
 		return nil
 	}
 	b.closed = true
 	err := b.st.save(b.state)
+	close(b.pumpStop)
+	b.mu.Unlock()
 	b.signal()
+	<-b.pumpDone // 等泵退出，避免与落盘/重开竞争
 	return err
+}
+
+// appendDeadLocked 在消息进入死信时追加一条不可变的判定记录。
+// 调用方已设置好 Status/DeadReason/ErrorClass/LastError。
+func (b *Broker) appendDeadLocked(m *Message, reason DeadReason) {
+	m.DeadHistory = append(m.DeadHistory, DeadEvent{
+		Round:      m.Round,
+		Reason:     reason,
+		ErrorClass: m.ErrorClass,
+		LastError:  m.LastError,
+		Attempts:   m.Attempts,
+		At:         time.Now(),
+	})
 }
 
 // backoff 计算第 n 次重试的等待时长（指数退避，封顶 BackoffMax）。
