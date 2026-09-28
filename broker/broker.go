@@ -18,15 +18,18 @@ import (
 //   - 同一分组同一时刻至多一条 inflight，且只允许组内最小序号投递，
 //     因此正常投递与重试过程中组内顺序稳定。
 type Broker struct {
-	cfg      Config
-	st       *store
-	mu       sync.Mutex
-	notify   chan struct{} // 状态变化信号（容量释放/新消息可投递）
-	state    *state
-	closed   bool
-	pumpStop chan struct{} // 关闭重放后台泵
-	pumpDone chan struct{} // 泵已退出
+	cfg    Config
+	st     *store
+	mu     sync.Mutex
+	notify chan struct{} // 状态变化代际通道：每次 signal 关闭并换新，广播唤醒全部等待者
+	state  *state
+	closed bool
 }
+
+// waitToken 在持锁状态下取得当前一代的唤醒通道；解锁后在 select 中
+// 等待它即可。通道关闭是广播：一次容量释放能同时唤醒所有等待者，
+// 某个等待者因 ctx 取消退出也不会"偷走"其他等待者的唤醒。
+func (b *Broker) waitToken() chan struct{} { return b.notify }
 
 // New 打开（或创建）一个 Broker，并从本地存储恢复状态。
 func New(cfg Config) (*Broker, error) {
@@ -61,27 +64,28 @@ func New(cfg Config) (*Broker, error) {
 	}
 	b := &Broker{
 		cfg: cfg, st: st, state: state,
-		notify:   make(chan struct{}, 1),
-		pumpStop: make(chan struct{}),
-		pumpDone: make(chan struct{}),
+		notify: make(chan struct{}),
 	}
 	if recovered > 0 {
 		if err := b.st.save(b.state); err != nil {
 			return nil, fmt.Errorf("persist recovery: %w", err)
 		}
 	}
-	// 恢复在途的死信重放意图：崩溃前未推完的重放由后台泵幂等续跑，
-	// 已重放的按 Applied 去重不会重放两次，未重放的不会丢。
-	go b.replayPump()
 	return b, nil
 }
 
-// signal 非阻塞地通知等待者状态已变化。
+// signal 广播一次状态变化：关闭当前代际通道并换新。
+// 可在持锁（用 signalLocked）或不持锁时调用。
 func (b *Broker) signal() {
-	select {
-	case b.notify <- struct{}{}:
-	default:
-	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.signalLocked()
+}
+
+// signalLocked 是持锁版本的广播。
+func (b *Broker) signalLocked() {
+	close(b.notify)
+	b.notify = make(chan struct{})
 }
 
 // occupied 返回占用容量的消息数（pending + inflight）。
@@ -136,6 +140,7 @@ func (b *Broker) Produce(ctx context.Context, group string, payload []byte) (str
 			b.signal()
 			return id, nil
 		}
+		wait := b.waitToken()
 		b.mu.Unlock()
 		if b.cfg.Policy == PolicyReject {
 			return "", ErrBrokerFull
@@ -144,7 +149,7 @@ func (b *Broker) Produce(ctx context.Context, group string, payload []byte) (str
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-b.notify:
+		case <-wait:
 		}
 	}
 }
@@ -233,6 +238,7 @@ func (b *Broker) Receive(ctx context.Context) (*Message, error) {
 			timer = time.NewTimer(time.Until(t))
 			timerC = timer.C
 		}
+		wait := b.waitToken()
 		b.mu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -240,7 +246,7 @@ func (b *Broker) Receive(ctx context.Context) (*Message, error) {
 				timer.Stop()
 			}
 			return nil, ctx.Err()
-		case <-b.notify:
+		case <-wait:
 			if timer != nil {
 				timer.Stop()
 			}
@@ -268,7 +274,7 @@ func (b *Broker) Ack(id string) error {
 			m.Status = StatusInflight
 			return fmt.Errorf("persist ack: %w", err)
 		}
-		b.signal()
+		b.signalLocked()
 		return nil
 	default:
 		return fmt.Errorf("%w: status=%s", ErrNotInflight, m.Status)
@@ -319,7 +325,7 @@ func (b *Broker) Nack(id string, retryable bool, cause string) error {
 		m.Status = StatusInflight
 		return fmt.Errorf("persist nack: %w", err)
 	}
-	b.signal()
+	b.signalLocked()
 	return nil
 }
 
@@ -354,10 +360,8 @@ func (b *Broker) Close() error {
 	}
 	b.closed = true
 	err := b.st.save(b.state)
-	close(b.pumpStop)
+	b.signalLocked() // 广播唤醒所有阻塞中的重放/生产/接收调用
 	b.mu.Unlock()
-	b.signal()
-	<-b.pumpDone // 等泵退出，避免与落盘/重开竞争
 	return err
 }
 

@@ -71,29 +71,23 @@ type Message struct {
 	Round      int        `json:"round"` // 当前生命周期轮次：0=首次，>=1 表示经过 N 次重放
 	// DeadHistory / ReplayHistory 是每轮判定与每次重放的完整轨迹，
 	// 重放不会删除既有死信记录，可在本地逐条核对"重放前/后状态与原因"。
-	DeadHistory    []DeadEvent     `json:"dead_history,omitempty"`
-	ReplayHistory  []ReplayEvent   `json:"replay_history,omitempty"`
-	ReplayID       string          `json:"replay_id,omitempty"`       // 当前所属的在途重放请求（重放时写入，死亡/确认后可用于归因）
-	PendingReplays map[string]bool `json:"pending_replays,omitempty"` // 已被哪些未完成重放请求覆盖（幂等去重）
+	DeadHistory   []DeadEvent   `json:"dead_history,omitempty"`
+	ReplayHistory []ReplayEvent `json:"replay_history,omitempty"`
+	ReplayID      string        `json:"replay_id,omitempty"` // 最近一次复活本条消息的重放请求 ID（死亡/确认后可用于归因）
 }
 
 // ReplayResult 是一次重放请求的结果快照。
+//
+// 整批原子语义下只有两种确定结果：
+//   - 放得下：整批重放成功，Replayed+Skipped==Total、Remaining==0；
+//   - 放不下（PolicyReject）：返回 ErrBrokerFull，结果为 nil，整批不生效。
 type ReplayResult struct {
 	ReplayID  string // 本次重放请求的确定性 ID
 	Group     string // 按分组重放时为该分组；按消息列表重放为空
-	Total     int    // 请求冻结时命中的死信数
-	Replayed  int    // 本次调用已重新投入投递的数量
-	Skipped   int    // 冻结目标中非死信（已重放/已恢复）被幂等跳过的数量
-	Remaining int    // 因容量暂时未能重放、已持久化待后台续跑的数量
-}
-
-// ReplayInfo 是一个持久化重放请求的可观测快照。
-type ReplayInfo struct {
-	ID      string
-	Group   string
-	Targets []string // 冻结的消息 ID（按旧序号排序）
-	Applied map[string]bool
-	Done    bool
+	Total     int    // 冻结目标总数（含调用时已不是死信的目标）
+	Replayed  int    // 本次调用真正从 dead 置回 pending 的数量
+	Skipped   int    // 目标中已不是死信（重复/并发调用被别的重放抢先复活）而幂等跳过的数量
+	Remaining int    // 恒为 0：整批语义下不存在"部分留待后台续跑"
 }
 
 // 可区分的错误原因，调用方可用 errors.Is 判定。
