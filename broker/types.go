@@ -71,29 +71,21 @@ type Message struct {
 	Round      int        `json:"round"` // 当前生命周期轮次：0=首次，>=1 表示经过 N 次重放
 	// DeadHistory / ReplayHistory 是每轮判定与每次重放的完整轨迹，
 	// 重放不会删除既有死信记录，可在本地逐条核对"重放前/后状态与原因"。
-	DeadHistory    []DeadEvent     `json:"dead_history,omitempty"`
-	ReplayHistory  []ReplayEvent   `json:"replay_history,omitempty"`
-	ReplayID       string          `json:"replay_id,omitempty"`       // 当前所属的在途重放请求（重放时写入，死亡/确认后可用于归因）
-	PendingReplays map[string]bool `json:"pending_replays,omitempty"` // 已被哪些未完成重放请求覆盖（幂等去重）
+	DeadHistory   []DeadEvent   `json:"dead_history,omitempty"`
+	ReplayHistory []ReplayEvent `json:"replay_history,omitempty"`
+	ReplayID      string        `json:"replay_id,omitempty"` // 最近一次成功重放的请求 ID（重放时写入，死亡/确认后可用于归因）
 }
 
 // ReplayResult 是一次重放请求的结果快照。
+// 整批原子语义下只有两种确定结果：整批重放成功（error=nil，Replayed=Total-Skipped，
+// Remaining=0）或整批失败（error 非 nil，调用方忽略本结果）。
 type ReplayResult struct {
 	ReplayID  string // 本次重放请求的确定性 ID
 	Group     string // 按分组重放时为该分组；按消息列表重放为空
-	Total     int    // 请求冻结时命中的死信数
-	Replayed  int    // 本次调用已重新投入投递的数量
-	Skipped   int    // 冻结目标中非死信（已重放/已恢复）被幂等跳过的数量
-	Remaining int    // 因容量暂时未能重放、已持久化待后台续跑的数量
-}
-
-// ReplayInfo 是一个持久化重放请求的可观测快照。
-type ReplayInfo struct {
-	ID      string
-	Group   string
-	Targets []string // 冻结的消息 ID（按旧序号排序）
-	Applied map[string]bool
-	Done    bool
+	Total     int    // 请求冻结时命中的目标数（死信 + 非死信）
+	Replayed  int    // 本次真正从 dead 置回 pending 的数量（与实际状态变化一致）
+	Skipped   int    // 冻结目标中非死信（重复/并发调用时已被重放）被幂等跳过的数量
+	Remaining int    // 恒为 0：整批原子完成，不存在留待后台续跑的剩余
 }
 
 // 可区分的错误原因，调用方可用 errors.Is 判定。
@@ -101,7 +93,7 @@ var (
 	ErrUnknownMessage   = errors.New("unknown message")       // 对未知消息确认/拒绝
 	ErrAlreadyAcked     = errors.New("message already acked") // 重复确认
 	ErrNotInflight      = errors.New("message not inflight")  // 消息不在可确认状态
-	ErrBrokerFull       = errors.New("broker at capacity")    // 背压：拒绝策略
+	ErrBrokerFull       = errors.New("broker at capacity")    // 背压：容量已满（Produce 与死信重放共用同一判定错误）
 	ErrOffsetRegression = errors.New("offset regression")     // 位点回退被拒绝
 	ErrClosed           = errors.New("broker closed")
 	ErrEmptyReplay      = errors.New("no dead letter to replay") // 重放目标中没有死信

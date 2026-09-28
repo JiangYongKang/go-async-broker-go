@@ -7,31 +7,22 @@ import (
 	"time"
 )
 
-// replayRequest 是一个持久化的死信重放请求（意图）。
-// 创建时冻结目标消息 ID（按旧序号排序），随后在容量允许时分块推进；
-// 进程在任意时刻崩溃，重启后由后台泵按相同冻结目标幂等续跑。
-type replayRequest struct {
-	ID      string          `json:"id"`
-	Group   string          `json:"group,omitempty"`
-	Targets []string        `json:"targets"`
-	Applied map[string]bool `json:"applied"`
-	Done    bool            `json:"done"`
-}
-
 // ReplayMessages 按消息 ID 批量重放死信。
 //
-// 语义：
-//   - 仅当前处于 dead 的消息会被冻结进本次重放请求；未知 ID 报错且整批
+// 语义（整批原子，与既有背压策略对齐）：
+//   - 仅当前处于 dead 的消息会成为本次重放目标；未知 ID 报错且整批
 //     不生效；目标均已不是死信（重复调用、并发调用）返回 ErrEmptyReplay，
 //     不会产生第二条在途消息；
+//   - 整批要么全部生效、要么全部不生效。容量不足以放下整批时：
+//     PolicyReject 立即返回与 Produce 相同的 ErrBrokerFull，死信状态、
+//     序号、顺序、死信原因一律不变，也没有任何后台续跑；调用方自行决定
+//     稍后整批重试或降级。PolicyBlock 阻塞到容量能容纳整批后一次性完成
+//     （或 ctx 取消 / Broker 关闭）；
 //   - 重放把同一条消息从 dead 置回 pending、清零本轮投递计数并分配新的
-//     全局序号（排到所属分组队尾），随后走与正常消息完全一致的
-//     投递/确认/重试/再次进死信流程；
-//   - 容量：PolicyBlock 下阻塞至全部重放完成（或 ctx 取消）；
-//     PolicyReject 下先重放当前容量内的一批，其余持久化后由后台泵在
-//     容量释放时自动续跑，返回 Remaining；
-//   - 重放意图先落盘再改状态（同一原子快照），崩溃后续跑严格幂等：
-//     同一条消息不会重放两次，也不会丢。
+//     全局序号（按旧序号顺序连续分配，重放消息整体排到队尾），随后走与
+//     正常消息完全一致的投递/确认/重试/再次进死信流程；
+//   - 全部状态变更在同一个原子快照内落盘：失败时整批回滚，任何情况下
+//     占用都不会超过 MaxPending。
 func (b *Broker) ReplayMessages(ctx context.Context, ids []string) (*ReplayResult, error) {
 	return b.replay(ctx, "", ids)
 }
@@ -60,59 +51,41 @@ func (b *Broker) replay(ctx context.Context, group string, ids []string) (*Repla
 			b.mu.Unlock()
 			return nil, ErrEmptyReplay
 		}
-		req, n := b.createAndApplyLocked(group, targets)
-		b.mu.Unlock()
-		b.signal()
-		res := &ReplayResult{
-			ReplayID:  req.ID,
-			Group:     group,
-			Total:     len(targets) + skipped,
-			Skipped:   skipped,
-			Replayed:  n,
-			Remaining: len(req.Targets) - n,
-		}
-		if b.cfg.Policy == PolicyReject || res.Remaining == 0 {
-			return res, nil
-		}
-		// PolicyBlock：阻塞直到后台泵（或本循环下一轮）推完整个请求。
-		select {
-		case <-ctx.Done():
-			return res, ctx.Err()
-		case <-b.notify:
-		case <-b.pumpStop:
-			return res, ErrClosed
-		}
-		for {
-			b.mu.Lock()
-			cur := b.state.Replays[req.ID]
-			doneCount := 0
-			if cur != nil {
-				doneCount = len(cur.Applied)
-			} else {
-				doneCount = res.Total // 已完成并清理
+		// 整批容量判定：死信不占容量，整批需要 len(targets) 个名额。
+		// 任何情况下都不允许部分放入。
+		if b.occupied()+len(targets) > b.cfg.MaxPending {
+			if b.cfg.Policy == PolicyReject {
+				// 拒绝策略：与 Produce 满容量时返回同一个错误，
+				// 不创建重放意图、不消费序号、不改动任何消息。
+				b.mu.Unlock()
+				return nil, ErrBrokerFull
 			}
-			closed := b.closed
+			// 阻塞策略：等待容量释放（与 Produce 的阻塞完全同源），
+			// 唤醒后重新冻结目标并重新做整批判定。
 			b.mu.Unlock()
-			if doneCount >= res.Total {
-				res.Replayed = res.Total
-				res.Remaining = 0
-				return res, nil
-			}
-			if closed {
-				return res, ErrClosed
-			}
 			select {
 			case <-ctx.Done():
-				res.Replayed = doneCount
-				res.Remaining = res.Total - doneCount
-				return res, ctx.Err()
+				return nil, ctx.Err()
 			case <-b.notify:
-			case <-b.pumpStop:
-				res.Replayed = doneCount
-				res.Remaining = res.Total - doneCount
-				return res, ErrClosed
+			case <-b.stop:
+				return nil, ErrClosed
 			}
+			continue
 		}
+		replayID, err := b.applyReplayLocked(targets)
+		b.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		b.signal()
+		return &ReplayResult{
+			ReplayID:  replayID,
+			Group:     group,
+			Total:     len(targets) + skipped,
+			Replayed:  len(targets),
+			Skipped:   skipped,
+			Remaining: 0, // 整批原子完成：不存在"留待后台续跑"的剩余
+		}, nil
 	}
 }
 
@@ -151,165 +124,82 @@ func (b *Broker) freezeTargetsLocked(group string, ids []string) ([]string, int,
 	return targets, skipped, nil
 }
 
-// createAndApplyLocked 持久化重放意图并尽量推进一批。
-// 意图创建与首批状态变更在同一个原子快照内落盘：崩溃只会发生在
-// "整体未落盘"或"整体已落盘"两个点上，结果确定。
-// 返回请求与本次实际重放数。调用方持锁。
-func (b *Broker) createAndApplyLocked(group string, targets []string) (*replayRequest, int) {
-	b.state.ReplaySeq++
-	req := &replayRequest{
-		ID:      fmt.Sprintf("replay-%d", b.state.ReplaySeq),
-		Group:   group,
-		Targets: targets,
-		Applied: map[string]bool{},
-	}
-	b.state.Replays[req.ID] = req
-	n := b.applyOneChunkLocked(req)
-	if n == 0 {
-		if _, still := b.state.Replays[req.ID]; still {
-			// 容量满、零进展：意图必须先落盘，之后由泵续跑。
-			_ = b.st.save(b.state)
-		}
-	}
-	return req, n
+// replayMsgSnapshot 是单条消息重放前的字段快照，落盘失败时整批回滚。
+type replayMsgSnapshot struct {
+	round      int
+	seq        uint64
+	status     Status
+	attempts   int
+	notBefore  time.Time
+	deadReason DeadReason
+	errorClass ErrorClass
+	lastError  string
+	replayID   string
+	historyLen int
 }
 
-// applyOneChunkLocked 在当前剩余容量内，把请求中尽可能多的死信重放，
-// 每个目标只处理一次，完成的请求移出未完成表。整批变更一次原子落盘。
-// 返回本次重放数量。调用方持锁。
-func (b *Broker) applyOneChunkLocked(req *replayRequest) int {
+// applyReplayLocked 把冻结目标整批从 dead 置回 pending 并一次性原子落盘。
+// 调用方必须已确认容量能容纳整批，且全部目标当前为 dead。
+// 落盘失败时所有字段（含序号计数器）整批回滚，调用方看到失败即等价于
+// 什么都没发生。返回本次重放请求的确定性 ID。调用方持锁。
+func (b *Broker) applyReplayLocked(targets []string) (string, error) {
 	now := time.Now()
-	n := 0
-	for _, id := range req.Targets {
-		if req.Applied[id] {
-			continue
-		}
-		m, ok := b.state.Messages[id]
-		if !ok {
-			req.Applied[id] = true // 防御：消息不存在，避免请求永久卡住
-			continue
-		}
-		if m.Status != StatusDead {
-			// 同一条死信只会被重放请求复活；出现非 dead 说明已被处理，
-			// 标记幂等跳过，绝不产生第二条在途消息。
-			req.Applied[id] = true
-			continue
-		}
-		if b.occupied() >= b.cfg.MaxPending {
-			break // 容量受限：剩余的交给下次（泵/唤醒）续跑
+	b.state.ReplaySeq++
+	replayID := fmt.Sprintf("replay-%d", b.state.ReplaySeq)
+	prevSeq := b.state.Seq
+	snaps := make([]replayMsgSnapshot, len(targets))
+	for i, id := range targets {
+		m := b.state.Messages[id]
+		snaps[i] = replayMsgSnapshot{
+			round:      m.Round,
+			seq:        m.Seq,
+			status:     m.Status,
+			attempts:   m.Attempts,
+			notBefore:  m.NotBefore,
+			deadReason: m.DeadReason,
+			errorClass: m.ErrorClass,
+			lastError:  m.LastError,
+			replayID:   m.ReplayID,
+			historyLen: len(m.ReplayHistory),
 		}
 		round := m.Round + 1
 		fromSeq := m.Seq
 		b.state.Seq++
-		toSeq := b.state.Seq
+		toSeq := b.state.Seq // 按旧序号顺序连续分配新序号：整批排到全局队尾
 		m.Round = round
-		m.Seq = toSeq // 分配新序号：排到所属分组（全局）队尾，不抢在未处理消息前
+		m.Seq = toSeq // 不抢在未处理消息前
 		m.Status = StatusPending
 		m.Attempts = 0
 		m.NotBefore = time.Time{} // 重放后立即可投递，重新获得完整重试机会
 		m.DeadReason = ""
 		m.ErrorClass = ""
 		m.LastError = ""
-		m.ReplayID = req.ID
-		if m.PendingReplays == nil {
-			m.PendingReplays = map[string]bool{}
-		}
-		m.PendingReplays[req.ID] = true
+		m.ReplayID = replayID
 		m.ReplayHistory = append(m.ReplayHistory, ReplayEvent{
-			Round: round, ReplayID: req.ID,
+			Round: round, ReplayID: replayID,
 			FromSeq: fromSeq, ToSeq: toSeq,
 			PrevState: StatusDead, At: now,
 		})
-		req.Applied[id] = true
-		n++
 	}
-	finished := len(req.Applied) == len(req.Targets)
-	if finished {
-		delete(b.state.Replays, req.ID)
-		for _, id := range req.Targets {
-			if m, ok := b.state.Messages[id]; ok && m.PendingReplays != nil {
-				delete(m.PendingReplays, req.ID)
-				if len(m.PendingReplays) == 0 {
-					m.PendingReplays = nil
-				}
-			}
+	if err := b.st.save(b.state); err != nil {
+		// 整批回滚：状态、序号、顺序、死信原因与调用前完全一致。
+		for i, id := range targets {
+			m := b.state.Messages[id]
+			s := snaps[i]
+			m.Round = s.round
+			m.Seq = s.seq
+			m.Status = s.status
+			m.Attempts = s.attempts
+			m.NotBefore = s.notBefore
+			m.DeadReason = s.deadReason
+			m.ErrorClass = s.errorClass
+			m.LastError = s.lastError
+			m.ReplayID = s.replayID
+			m.ReplayHistory = m.ReplayHistory[:s.historyLen]
 		}
+		b.state.Seq = prevSeq
+		b.state.ReplaySeq--
+		return "", fmt.Errorf("persist replay: %w", err)
 	}
-	// 有重放、或本批把请求完成（可能仅含跳过项）都需要落盘；
-	// 容量满且无任何进展时，createAndApplyLocked 负责落盘新建意图。
-	if n > 0 || finished {
-		_ = b.st.save(b.state)
-	}
-	return n
-}
-
-// replayPump 是后台续跑泵：启动时、容量释放/状态变化时，把所有未完成
-// 重放请求在容量内向前推进。泵永不因容量阻塞，崩溃重启后自动接管。
-func (b *Broker) replayPump() {
-	defer close(b.pumpDone)
-	for {
-		b.mu.Lock()
-		if b.closed {
-			b.mu.Unlock()
-			return
-		}
-		advanced := b.pumpOnceLocked()
-		b.mu.Unlock()
-		if advanced {
-			b.signal() // 唤醒阻塞中的 ReplayMessages/Group 调用
-		}
-		select {
-		case <-b.pumpStop:
-			return
-		case <-b.notify:
-		}
-	}
-}
-
-// pumpOnceLocked 按请求 ID 顺序各推进一步（一个容量块），返回是否有进展。
-func (b *Broker) pumpOnceLocked() bool {
-	if len(b.state.Replays) == 0 {
-		return false
-	}
-	ids := make([]string, 0, len(b.state.Replays))
-	for id := range b.state.Replays {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	advanced := false
-	for _, id := range ids {
-		req := b.state.Replays[id]
-		if req == nil {
-			continue
-		}
-		if n := b.applyOneChunkLocked(req); n > 0 {
-			advanced = true
-		}
-	}
-	return advanced
-}
-
-// PendingReplays 返回未完成重放请求的快照（用于观测与验证）。
-func (b *Broker) PendingReplays() []ReplayInfo {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	ids := make([]string, 0, len(b.state.Replays))
-	for id := range b.state.Replays {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	out := make([]ReplayInfo, 0, len(ids))
-	for _, id := range ids {
-		req := b.state.Replays[id]
-		applied := make(map[string]bool, len(req.Applied))
-		for k, v := range req.Applied {
-			applied[k] = v
-		}
-		targets := append([]string(nil), req.Targets...)
-		out = append(out, ReplayInfo{
-			ID: req.ID, Group: req.Group,
-			Targets: targets, Applied: applied, Done: req.Done,
-		})
-	}
-	return out
+	return replayID, nil
 }

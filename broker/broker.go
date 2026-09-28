@@ -18,14 +18,13 @@ import (
 //   - 同一分组同一时刻至多一条 inflight，且只允许组内最小序号投递，
 //     因此正常投递与重试过程中组内顺序稳定。
 type Broker struct {
-	cfg      Config
-	st       *store
-	mu       sync.Mutex
-	notify   chan struct{} // 状态变化信号（容量释放/新消息可投递）
-	state    *state
-	closed   bool
-	pumpStop chan struct{} // 关闭重放后台泵
-	pumpDone chan struct{} // 泵已退出
+	cfg    Config
+	st     *store
+	mu     sync.Mutex
+	notify chan struct{} // 状态变化信号（容量释放/新消息可投递）
+	state  *state
+	closed bool
+	stop   chan struct{} // Broker 关闭信号，唤醒所有阻塞等待者
 }
 
 // New 打开（或创建）一个 Broker，并从本地存储恢复状态。
@@ -60,19 +59,19 @@ func New(cfg Config) (*Broker, error) {
 		}
 	}
 	b := &Broker{
-		cfg: cfg, st: st, state: state,
-		notify:   make(chan struct{}, 1),
-		pumpStop: make(chan struct{}),
-		pumpDone: make(chan struct{}),
+		cfg:    cfg,
+		st:     st,
+		state:  state,
+		notify: make(chan struct{}, 1),
+		stop:   make(chan struct{}),
 	}
 	if recovered > 0 {
 		if err := b.st.save(b.state); err != nil {
 			return nil, fmt.Errorf("persist recovery: %w", err)
 		}
 	}
-	// 恢复在途的死信重放意图：崩溃前未推完的重放由后台泵幂等续跑，
-	// 已重放的按 Applied 去重不会重放两次，未重放的不会丢。
-	go b.replayPump()
+	// 死信重放为整批原子操作：要么整批落盘完成、要么什么都不发生，
+	// 不存在"推到一半"的未完成意图，因此无需后台续跑泵。
 	return b, nil
 }
 
@@ -354,10 +353,9 @@ func (b *Broker) Close() error {
 	}
 	b.closed = true
 	err := b.st.save(b.state)
-	close(b.pumpStop)
+	close(b.stop)
 	b.mu.Unlock()
-	b.signal()
-	<-b.pumpDone // 等泵退出，避免与落盘/重开竞争
+	b.signal() // 唤醒阻塞在 Produce / 重放上的调用，使其返回 ErrClosed
 	return err
 }
 
